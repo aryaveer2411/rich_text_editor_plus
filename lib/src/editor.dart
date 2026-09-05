@@ -45,6 +45,14 @@ class RichTextEditor extends StatefulWidget {
   /// Called when the editor loses focus.
   final VoidCallback? onBlur;
 
+  /// Called with the wheel delta when the editor is scrolled past its own scroll boundary, so an
+  /// enclosing scroll view can continue (scroll chaining across the web iframe boundary).
+  final void Function(double deltaY)? onOverscroll;
+
+  /// Called with the wheel delta on every wheel event over the editor (web), regardless of scroll
+  /// position. See [RichEditorController.onWheel].
+  final void Function(double deltaY)? onWheel;
+
   /// Height of the editor area (not including toolbar).
   /// Defaults to 300 if not specified.
   final double? editorHeight;
@@ -56,6 +64,8 @@ class RichTextEditor extends StatefulWidget {
   final bool toolbarAtTop;
 
   /// Custom link dialog builder. If null, a default Material dialog is shown.
+  /// When editing an existing link, its display text is available via
+  /// `controller.selectionStyle.linkText`.
   final Future<LinkDialogResult?> Function(BuildContext context, String? currentUrl)? onLinkDialog;
 
   /// Optional custom toolbar widget. When provided, this widget is rendered
@@ -71,6 +81,8 @@ class RichTextEditor extends StatefulWidget {
     this.onChanged,
     this.onFocus,
     this.onBlur,
+    this.onOverscroll,
+    this.onWheel,
     this.editorHeight,
     this.showToolbar = true,
     this.toolbarAtTop = true,
@@ -95,30 +107,45 @@ class _RichTextEditorState extends State<RichTextEditor> {
   void didUpdateWidget(covariant RichTextEditor oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.controller != widget.controller) {
-      _unwireController(oldWidget.controller);
+      _unwireController(oldWidget.controller, oldWidget);
       _wireController();
     }
     if (oldWidget.onChanged != widget.onChanged) {
       widget.controller.onContentChanged = widget.onChanged;
     }
+    if (oldWidget.onOverscroll != widget.onOverscroll) {
+      widget.controller.onOverscroll = widget.onOverscroll;
+    }
+    if (oldWidget.onWheel != widget.onWheel) {
+      widget.controller.onWheel = widget.onWheel;
+    }
   }
 
   @override
   void dispose() {
-    _unwireController(widget.controller);
+    _unwireController(widget.controller, widget);
     super.dispose();
   }
 
   void _wireController() {
     widget.controller.onContentChanged = widget.onChanged;
     widget.controller.onLinkRequest = _handleLinkRequest;
+    widget.controller.onOverscroll = widget.onOverscroll;
+    widget.controller.onWheel = widget.onWheel;
     widget.controller.addListener(_onControllerChanged);
   }
 
-  void _unwireController(RichEditorController controller) {
+  // Releases the controller's callback slots that [forWidget] put there. Each slot holds a single
+  // callback, and a controller can be handed from one editor to another (a compose surface that
+  // moves between hosts): the new editor wires itself up before the old one is disposed, so clearing
+  // unconditionally would strip the *live* editor's callbacks — leaving it with no scroll chaining,
+  // no link dialog and no change events. Only clear what is still ours.
+  void _unwireController(RichEditorController controller, RichTextEditor forWidget) {
     controller.removeListener(_onControllerChanged);
-    controller.onContentChanged = null;
-    controller.onLinkRequest = null;
+    if (controller.onContentChanged == forWidget.onChanged) controller.onContentChanged = null;
+    if (controller.onLinkRequest == _handleLinkRequest) controller.onLinkRequest = null;
+    if (controller.onOverscroll == forWidget.onOverscroll) controller.onOverscroll = null;
+    if (controller.onWheel == forWidget.onWheel) controller.onWheel = null;
   }
 
   void _onControllerChanged() {
@@ -160,7 +187,7 @@ class _RichTextEditorState extends State<RichTextEditor> {
 
   Future<LinkDialogResult?> _showDefaultLinkDialog(BuildContext context, String? currentUrl) async {
     final urlController = TextEditingController(text: currentUrl ?? '');
-    final textController = TextEditingController();
+    final textController = TextEditingController(text: currentUrl != null ? (widget.controller.selectionStyle.linkText ?? '') : '');
 
     return showDialog<LinkDialogResult>(
       context: context,

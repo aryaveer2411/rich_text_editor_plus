@@ -4,6 +4,11 @@ import '../theme.dart';
 ///
 /// Communication protocol:
 ///   Flutter → JS:  evaluateJavascript calling window.editorBridge.*
+///                   On web the iframe is sandboxed without allow-same-origin
+///                   (see WebEditor), so the parent can't call contentWindow.eval()
+///                   directly; it instead posts { __exec, id, code } and this frame
+///                   eval's `code` in its own realm, replying with an __execResult
+///                   message carrying the same id.
 ///   JS → Flutter:  window.flutter_channel.postMessage(JSON.stringify({...}))
 ///                   On web: window.parent.postMessage(...)
 ///
@@ -14,7 +19,11 @@ import '../theme.dart';
 ///   { type: 'focus' }
 ///   { type: 'blur' }
 ///   { type: 'linkRequest' }  (when user presses Ctrl+K)
-String generateEditorHtml(RichEditorTheme theme) {
+///   { type: '__execResult', id: number, result: any }  (web only, reply to an __exec command)
+///
+/// Every message is stamped with `channelId` (the host's unique view id) so a host that hosts
+/// multiple editors on the same window can route each message to the matching editor only.
+String generateEditorHtml(RichEditorTheme theme, {String channelId = ''}) {
   final bgColor = _colorToCss(theme.editorBackground);
   final textColor = _colorToCss(theme.editorTextColor);
   final placeholderColor = _colorToCss(theme.placeholderColor);
@@ -59,7 +68,22 @@ String generateEditorHtml(RichEditorTheme theme) {
     outline: none;
     overflow-y: auto;
     word-wrap: break-word;
-    white-space: pre-wrap;
+    /* Whitespace collapses, as it does in every browser and mail client. Under pre-wrap Chrome
+       inserts a literal newline for Shift+Enter instead of a <br>, and the exported HTML then
+       reads as a plain space wherever it lands. */
+    white-space: normal;
+  }
+
+  /* Slim scrollbar on the editor so long bodies show a scroll indicator on the right. */
+  #editor::-webkit-scrollbar {
+    width: 8px;
+  }
+  #editor::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.28);
+    border-radius: 4px;
+  }
+  #editor::-webkit-scrollbar-track {
+    background: transparent;
   }
 
   #editor:empty:before {
@@ -117,11 +141,21 @@ String generateEditorHtml(RichEditorTheme theme) {
   var editor = document.getElementById('editor');
   var isComposing = false;
   var debounceTimer = null;
+  // When true the editable editor grows to fit its content and reports its
+  // height to Flutter on every edit, so a parent page-scroll can move through
+  // the whole body (instead of the body owning its own inner scroll). Toggled
+  // by setAutoHeight() — off by default so nothing changes for callers that
+  // don't opt in.
+  var autoHeight = false;
 
   // -----------------------------------------------------------------------
   // Communication: send messages to Flutter
   // -----------------------------------------------------------------------
   function sendToFlutter(data) {
+    // Stamp the source editor id. On web every editor iframe postMessages to the SAME parent
+    // window, so the host must be able to tell which editor a message came from — otherwise
+    // each controller would process every other editor's events (cross-talk).
+    data.channelId = '$channelId';
     var msg = JSON.stringify(data);
     try {
       // Mobile WebView channel (Android/iOS)
@@ -351,12 +385,14 @@ String generateEditorHtml(RichEditorTheme theme) {
   // -----------------------------------------------------------------------
   function reportSelectionStyle() {
     var linkUrl = null;
+    var linkText = null;
     var sel = window.getSelection();
     if (sel && sel.rangeCount > 0) {
       var node = sel.anchorNode;
       while (node && node !== editor) {
         if (node.nodeType === Node.ELEMENT_NODE && node.tagName.toLowerCase() === 'a') {
           linkUrl = node.getAttribute('href');
+          linkText = node.textContent;
           break;
         }
         node = node.parentNode;
@@ -392,6 +428,7 @@ String generateEditorHtml(RichEditorTheme theme) {
       orderedList: document.queryCommandState('insertOrderedList'),
       unorderedList: document.queryCommandState('insertUnorderedList'),
       linkUrl: linkUrl,
+      linkText: linkText,
       alignment: alignment
     });
   }
@@ -431,6 +468,21 @@ String generateEditorHtml(RichEditorTheme theme) {
     insertLink: function(url, text) {
       editor.focus();
       var sel = window.getSelection();
+      // Editing: selection inside an existing anchor → update it in place. Without
+      // this, a collapsed cursor would insert a second anchor next to the first
+      // (createLink is a no-op on a collapsed selection, and the text branch
+      // creates a brand-new <a>).
+      var node = sel && sel.rangeCount > 0 ? sel.anchorNode : null;
+      while (node && node !== editor) {
+        if (node.nodeType === Node.ELEMENT_NODE && node.tagName.toLowerCase() === 'a') {
+          node.setAttribute('href', url);
+          if (text && text !== node.textContent) node.textContent = text;
+          reportContent();
+          reportSelectionStyle();
+          return;
+        }
+        node = node.parentNode;
+      }
       if (sel.toString().length > 0) {
         document.execCommand('createLink', false, url);
       } else if (text) {
@@ -533,7 +585,52 @@ String generateEditorHtml(RichEditorTheme theme) {
         editor.style.overflowY = 'visible';
         editor.style.height = 'auto';
         editor.style.minHeight = 'auto';
-        setTimeout(reportHeight, 100);
+        setTimeout(fitReadOnlyWidth, 100);
+        // Re-fit / re-measure as images finish loading (plus a later safety net):
+        // late signature images change width and height, so refit to the viewport
+        // width and re-report the resulting height. This also avoids the read-only
+        // iframe overflowing (which would show its own extra scrollbar).
+        var roImgs = editor.querySelectorAll('img');
+        for (var ri = 0; ri < roImgs.length; ri++) {
+          if (!roImgs[ri].complete) {
+            roImgs[ri].addEventListener('load', fitReadOnlyWidth);
+            roImgs[ri].addEventListener('error', fitReadOnlyWidth);
+          }
+        }
+        setTimeout(fitReadOnlyWidth, 600);
+      }
+    },
+
+    // Toggle editable auto-height mode. When enabled, the editor stops owning an
+    // inner scroll and instead grows to its content height, reporting that height
+    // to Flutter so a parent scroll view can scroll through the whole body. When
+    // disabled, the editor reverts to a fixed height with its own inner scroll
+    // (the normal editable behaviour used while typing).
+    setAutoHeight: function(value) {
+      autoHeight = !!value;
+      if (autoHeight) {
+        document.documentElement.style.height = 'auto';
+        // hidden, not visible: the host resizes this frame to the height we report, and that costs a
+        // message hop plus a frame — so on every newline the document is briefly taller than the
+        // frame. With 'visible' the browser paints its own scrollbar for those few milliseconds and
+        // then removes it again: a scrollbar blinking on every Enter. Clipping that sliver instead is
+        // invisible (it is the blank line just added, and the host has caught up by the next frame),
+        // and scrollHeight — what reportHeight measures — is not affected by overflow.
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.height = 'auto';
+        document.body.style.overflow = 'hidden';
+        editor.style.overflowY = 'visible';
+        editor.style.height = 'auto';
+        editor.style.minHeight = 'auto';
+        setTimeout(reportHeight, 50);
+      } else {
+        document.documentElement.style.height = '100%';
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.height = '100%';
+        document.body.style.overflow = 'hidden';
+        editor.style.overflowY = 'auto';
+        editor.style.height = '100%';
+        editor.style.minHeight = '';
       }
     }
   };
@@ -545,6 +642,106 @@ String generateEditorHtml(RichEditorTheme theme) {
     sendToFlutter({ type: 'heightChanged', height: document.body.scrollHeight });
   }
 
+  // Where the caret is inside this document, so a host that owns the scroll can keep it in view.
+  //
+  // Only meaningful in auto-height mode: there this frame has no scroll of its own (see
+  // setAutoHeight), so the browser cannot bring the caret into view itself and the host — which sizes
+  // this frame and scrolls its own window onto it — is the only thing that can. Offsets are measured
+  // from the same origin as the reported height, so the host can use them against that height
+  // directly.
+  function reportCaret() {
+    var sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    var range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return;
+    var rect = range.getBoundingClientRect();
+    // A collapsed caret on an empty line (<div><br></div>) measures nothing at all. That line's own
+    // block is exactly the box we want anyway, so fall back to it.
+    if (!rect || (rect.top === 0 && rect.bottom === 0)) {
+      var node = range.startContainer;
+      if (node.nodeType !== Node.ELEMENT_NODE) node = node.parentNode;
+      if (!node || !node.getBoundingClientRect) return;
+      rect = node.getBoundingClientRect();
+    }
+    var origin = document.body.getBoundingClientRect().top;
+    sendToFlutter({
+      type: 'caretMoved',
+      top: Math.floor(rect.top - origin),
+      bottom: Math.ceil(rect.bottom - origin)
+    });
+  }
+
+  // Read-only fit-to-width: wide content (e.g. a 500px signature table) would
+  // overflow a narrow mobile viewport. Scale the whole body down with CSS zoom so
+  // it fits the width — like Gmail's mobile "fit to width" — instead of needing an
+  // awkward horizontal scroll. zoom (unlike transform) shrinks layout height too,
+  // so the reported height stays correct. Only ever shrinks (min with 1), so it is
+  // a no-op when the content already fits (e.g. desktop web).
+  function fitReadOnlyWidth() {
+    document.body.style.zoom = '1';
+    var viewWidth = document.documentElement.clientWidth || window.innerWidth || 0;
+    var contentWidth = document.body.scrollWidth;
+    if (viewWidth > 0 && contentWidth > viewWidth) {
+      document.body.style.zoom = String(viewWidth / contentWidth);
+    }
+    // Report the rendered (zoom-applied) height so the host sizes the iframe right.
+    sendToFlutter({ type: 'heightChanged', height: Math.ceil(document.body.getBoundingClientRect().height) });
+  }
+
+  // Rewrite Gmail image-proxy srcs (…googleusercontent.com/…#<original>) back to
+  // the embedded original URL so pasted Gmail signatures render in the editor
+  // instead of showing broken proxied images. Proxy srcs without a '#<url>'
+  // fragment (e.g. Gmail's private mail-sig photos) have no public source and are
+  // left as-is.
+  function unwrapProxiedImages() {
+    var imgs = editor.querySelectorAll('img');
+    for (var i = 0; i < imgs.length; i++) {
+      var src = imgs[i].getAttribute('src') || '';
+      if (src.indexOf('googleusercontent.com') === -1) continue;
+      var hashIdx = src.indexOf('#http');
+      if (hashIdx !== -1) {
+        imgs[i].setAttribute('src', src.substring(hashIdx + 1));
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Command channel: Flutter -> this frame. Needed on web, where the parent
+  // can no longer call contentWindow.eval() on this sandboxed, cross-origin
+  // iframe directly (see WebEditor) — postMessage is the one channel the
+  // browser still allows across that boundary. `code` is the exact same
+  // "window.editorBridge.xxx(...)" string evaluateJavascript always sent, now
+  // eval'd here in this frame's own realm instead of the parent's, so every
+  // editorBridge.* call above behaves exactly as before. Mobile's WebView
+  // still runs JS directly and never sends this message.
+  //
+  // event.source is checked against window.parent so only the actual host
+  // frame can trigger this — not some unrelated window with a stray reference,
+  // and not this frame's own (possibly attacker-controlled) content posting to
+  // itself.
+  // -----------------------------------------------------------------------
+  window.addEventListener('message', function(event) {
+    // The message arrives as a JSON string (see WebEditor.evaluateJavascript), not
+    // a structured-clone object, so it must be parsed before any property access.
+    if (typeof event.data !== 'string' || event.source !== window.parent) return;
+    var data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
+    if (!data || data.__exec !== true) return;
+    var result;
+    try {
+      result = eval(data.code);
+    } catch (e) {
+      result = undefined;
+    }
+    if (data.id !== undefined && data.id !== null) {
+      sendToFlutter({ type: '__execResult', id: data.id, result: result });
+    }
+  });
+
   // -----------------------------------------------------------------------
   // Event listeners
   // -----------------------------------------------------------------------
@@ -552,6 +749,13 @@ String generateEditorHtml(RichEditorTheme theme) {
   editor.addEventListener('input', function() {
     if (!isComposing) {
       reportContent();
+      // In auto-height mode the body must resize as the user types/pastes so the
+      // parent page-scroll always reaches the newest content, and the caret it has to keep in view
+      // has just moved with the edit.
+      if (autoHeight) {
+        reportHeight();
+        reportCaret();
+      }
     }
   });
 
@@ -566,6 +770,9 @@ String generateEditorHtml(RichEditorTheme theme) {
 
   document.addEventListener('selectionchange', function() {
     reportSelectionStyle();
+    // Arrow keys and clicks move the caret without changing the content, and in auto-height mode the
+    // host still has to be able to follow it.
+    if (autoHeight) reportCaret();
   });
 
   editor.addEventListener('focus', function() {
@@ -577,9 +784,39 @@ String generateEditorHtml(RichEditorTheme theme) {
     reportContent();
   });
 
-  // Paste: let the browser handle it natively, then report changes
+  // Scroll chaining: when the editor cannot scroll further in the wheel direction (or has no
+  // scrollable overflow at all), forward the delta to the Flutter host so an enclosing scroll
+  // view can continue. A web iframe otherwise swallows the wheel at its boundary and never
+  // bubbles it to the parent document.
+  editor.addEventListener('wheel', function(e) {
+    // Fire on EVERY wheel so a host can react to any scroll immediately (e.g. collapse a header on
+    // first scroll, in either direction) — independent of the editor's own scroll position.
+    sendToFlutter({ type: 'wheel', deltaY: e.deltaY });
+    // Additionally, at the scroll boundary (or when there's no scrollable overflow) forward the delta
+    // so an enclosing scroll view can continue (scroll chaining across the iframe boundary).
+    var atTop = editor.scrollTop <= 0;
+    var atBottom = editor.scrollTop + editor.clientHeight >= editor.scrollHeight - 1;
+    var noScroll = editor.scrollHeight <= editor.clientHeight;
+    if (noScroll || (e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom)) {
+      sendToFlutter({ type: 'overscroll', deltaY: e.deltaY });
+    }
+  });
+
+  // In auto-height mode this frame must never hold a scroll offset of its own — the host sizes it to
+  // the content and scrolls the page instead. If the browser scrolls the caret into view during the
+  // frame or two before the host catches up, that offset would stick: overflow is hidden, so nothing
+  // could ever scroll it back and the top of the body would stay cut off. Snap it back to 0.
+  window.addEventListener('scroll', function() {
+    if (!autoHeight) return;
+    if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
+    if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
+  });
+
+  // Paste: let the browser handle it natively, then unwrap any Gmail image-proxy
+  // srcs and report changes.
   editor.addEventListener('paste', function(e) {
     setTimeout(function() {
+      unwrapProxiedImages();
       reportContent();
       reportSelectionStyle();
     }, 50);

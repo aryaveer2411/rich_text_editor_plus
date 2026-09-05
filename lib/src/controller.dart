@@ -46,11 +46,36 @@ class RichEditorController extends ChangeNotifier {
   double? _contentHeight;
   double? get contentHeight => _contentHeight;
 
+  double? _caretTop;
+  double? _caretBottom;
+
+  /// Top and bottom of the line the caret is on, measured from the top of the document — the same
+  /// origin as [contentHeight], so a host can use them against the height it sizes the editor to.
+  ///
+  /// Reported in auto-height mode only, where this editor has no scroll of its own and the host is
+  /// the only thing that can bring the caret into view. Null until the first report.
+  double? get caretTop => _caretTop;
+  double? get caretBottom => _caretBottom;
+
   /// Callback for content changes.
   ContentChangedCallback? onContentChanged;
 
   /// Callback when Ctrl+K requests a link dialog.
   LinkRequestCallback? onLinkRequest;
+
+  /// Called with the wheel delta when the editor is scrolled past its own scroll boundary, so a
+  /// host scroll view can continue scrolling (scroll chaining across the web iframe boundary).
+  void Function(double deltaY)? onOverscroll;
+
+  /// Called with the wheel delta on EVERY wheel event over the editor (web), regardless of scroll
+  /// position or direction — for hosts that want to react to any scroll (e.g. collapse a header on
+  /// the first scroll).
+  void Function(double deltaY)? onWheel;
+
+  /// Called with a link's URL when it is tapped in a (read-only) body. The mobile
+  /// WebView blocks in-editor navigation, so the host opens the URL externally
+  /// (e.g. url_launcher). On web, links open natively so this is unused.
+  void Function(String url)? onLinkTap;
 
   /// Internal: set by WebEditor on web to toggle the iframe's pointer-events.
   /// Pass null to unregister.
@@ -58,6 +83,13 @@ class RichEditorController extends ChangeNotifier {
 
   void setPointerEventsCallback(void Function(bool enable)? callback) {
     _pointerEventsCallback = callback;
+  }
+
+  /// Unregisters [callback], but only if it is still the registered one — a later editor sharing this
+  /// controller may already have replaced it, and clearing that one would leave the live editor unable
+  /// to release its iframe's pointer events.
+  void clearPointerEventsCallback(void Function(bool enable) callback) {
+    if (identical(_pointerEventsCallback, callback)) _pointerEventsCallback = null;
   }
 
   /// Disable pointer events on the editor iframe (call before showing a dialog on web).
@@ -81,8 +113,33 @@ class RichEditorController extends ChangeNotifier {
   /// optimistic formatting fields set by the most recent toggle.
   static const int _toggleGuardMs = 200;
 
-  /// Function to evaluate JavaScript. Set by the platform editor widget.
-  Future<String?> Function(String js)? evaluateJavascript;
+  /// Function to evaluate JavaScript. Set by the platform editor widget as soon as it has a
+  /// WebView/iframe to run JS in. Assigning it drains any commands queued while there was none.
+  ///
+  /// A new editor claiming the channel also puts the controller back to not-ready: readiness belongs
+  /// to a document, and the incoming editor's has not loaded yet. Without that, a controller handed
+  /// between editors carries `_isReady` over from the old one and every command sent before the new
+  /// document announces itself is evaluated against a page that cannot run it — silently lost
+  /// instead of queued.
+  Future<String?> Function(String js)? _evaluateJavascript;
+  Future<String?> Function(String js)? get evaluateJavascript => _evaluateJavascript;
+  set evaluateJavascript(Future<String?> Function(String js)? fn) {
+    final bool isNewChannel = fn != null && !identical(fn, _evaluateJavascript);
+    _evaluateJavascript = fn;
+    if (isNewChannel) _isReady = false;
+    _flushIfReady();
+  }
+
+  /// Runs any queued commands once the editor is ready AND a JS executor exists.
+  /// Iterates a copy so commands re-queued mid-flush can't corrupt the iteration.
+  void _flushIfReady() {
+    if (!_isReady || _evaluateJavascript == null) return;
+    final List<String> pending = List<String>.from(_commandQueue);
+    _commandQueue.clear();
+    for (final js in pending) {
+      _evaluateJavascript!(js);
+    }
+  }
 
   /// Optional initial HTML content to load when the editor is ready.
   String? initialHtml;
@@ -90,7 +147,15 @@ class RichEditorController extends ChangeNotifier {
   /// Whether the editor is read-only (non-editable).
   bool readOnly;
 
-  RichEditorController({this.initialHtml, this.readOnly = false});
+  /// Whether the editable editor is in auto-height mode — see [setAutoHeight].
+  ///
+  /// Persisted on the controller, like [readOnly] and [initialHtml], so it can be re-applied to a
+  /// fresh editor: a controller can outlive the editor widget it drives (a compose surface that moves
+  /// between two hosts, a minimise/restore, …) and every new editor starts in the default
+  /// fixed-height mode.
+  bool autoHeight;
+
+  RichEditorController({this.initialHtml, this.readOnly = false, this.autoHeight = false});
 
   // -----------------------------------------------------------------------
   // Handle messages from JS
@@ -127,6 +192,7 @@ class RichEditorController extends ChangeNotifier {
               isOrderedList: data['orderedList'] == true,
               isUnorderedList: data['unorderedList'] == true,
               linkUrl: data['linkUrl'] as String?,
+              linkText: data['linkText'] as String?,
               alignment: (data['alignment'] as String?) ?? 'left',
             );
           } else {
@@ -150,16 +216,35 @@ class RichEditorController extends ChangeNotifier {
           if (readOnly) {
             _executeJs("window.editorBridge.setReadOnly(true)");
           }
-          // Flush queued commands
-          for (final js in _commandQueue) {
-            _executeJs(js);
+          // Re-assert auto-height on every editor that becomes ready, not just the one that was
+          // live when setAutoHeight() was called. Without this, a host that swaps editors under the
+          // same controller silently loses the setting: _isReady is still true from the previous
+          // editor, so the setAutoHeight() the new host sends on mount is executed against the old,
+          // dying iframe instead of being queued for the new one — which then keeps its own inner
+          // scroll and never reports a height.
+          if (autoHeight) {
+            _executeJs("window.editorBridge.setAutoHeight(true)");
           }
-          _commandQueue.clear();
+          // Flush queued commands — safe against the mobile race where 'ready'
+          // arrives before evaluateJavascript is wired (the setter re-flushes then).
+          _flushIfReady();
           notifyListeners();
           break;
 
         case 'heightChanged':
           _contentHeight = (data['height'] as num?)?.toDouble();
+          notifyListeners();
+          break;
+
+        case 'caretMoved':
+          final double? caretTop = (data['top'] as num?)?.toDouble();
+          final double? caretBottom = (data['bottom'] as num?)?.toDouble();
+          if (caretTop == null || caretBottom == null) break;
+          // Every keystroke and every arrow key reports, and most land on the same line — a host that
+          // scrolls to the caret would otherwise be asked to do it again for no movement.
+          if (caretTop == _caretTop && caretBottom == _caretBottom) break;
+          _caretTop = caretTop;
+          _caretBottom = caretBottom;
           notifyListeners();
           break;
 
@@ -175,6 +260,14 @@ class RichEditorController extends ChangeNotifier {
 
         case 'linkRequest':
           onLinkRequest?.call();
+          break;
+
+        case 'overscroll':
+          onOverscroll?.call((data['deltaY'] as num?)?.toDouble() ?? 0);
+          break;
+
+        case 'wheel':
+          onWheel?.call((data['deltaY'] as num?)?.toDouble() ?? 0);
           break;
 
         default:
@@ -272,6 +365,29 @@ class RichEditorController extends ChangeNotifier {
     _executeJs("window.editorBridge.setReadOnly(${value ? 'true' : 'false'})");
   }
 
+  /// Toggle editable auto-height mode at runtime.
+  ///
+  /// When [value] is true the editor grows to fit its content and reports its
+  /// height (via `heightChanged`), so a parent scroll view can scroll through
+  /// the whole body. When false it reverts to a fixed height with its own inner
+  /// scroll, and the stale [contentHeight] (and caret) is dropped so the next build falls
+  /// back to the host-provided height.
+  void setAutoHeight(bool value) {
+    // Remembered so a later editor can pick it up on its own 'ready' — see handleMessage.
+    autoHeight = value;
+    _executeJs("window.editorBridge.setAutoHeight(${value ? 'true' : 'false'})");
+    // Cleared WITHOUT notifying, deliberately. Hosts switch auto-height off while tearing down (the
+    // usual reason being that they are handing this controller to another editor), and a notification
+    // dispatched from a dispose() reaches listeners whose elements are mid-unmount — asking them to
+    // rebuild while the widget tree is locked, which throws. Nothing is lost: whichever editor renders
+    // next reads the cleared value on its first build.
+    if (!value) {
+      _contentHeight = null;
+      _caretTop = null;
+      _caretBottom = null;
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Toolbar action dispatch
   // -----------------------------------------------------------------------
@@ -362,16 +478,16 @@ class RichEditorController extends ChangeNotifier {
   // -----------------------------------------------------------------------
 
   void _executeJs(String js) {
-    if (_isReady && evaluateJavascript != null) {
-      evaluateJavascript!(js);
+    if (_isReady && _evaluateJavascript != null) {
+      _evaluateJavascript!(js);
     } else {
       _commandQueue.add(js);
     }
   }
 
   Future<String?> _executeJsWithResult(String js) async {
-    if (evaluateJavascript != null) {
-      return evaluateJavascript!(js);
+    if (_evaluateJavascript != null) {
+      return _evaluateJavascript!(js);
     }
     return null;
   }
