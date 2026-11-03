@@ -30,6 +30,13 @@ jobs:
       - name: Run tests
         run: flutter test
 
+      # Tools above can rewrite tracked files; show what changed, then publish exactly what was tagged.
+      - name: Restore tracked files
+        run: |
+          git diff --stat
+          git diff
+          git checkout -- .
+
       - name: Publish (dry run)
         run: dart pub publish --dry-run
 
