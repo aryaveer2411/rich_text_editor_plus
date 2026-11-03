@@ -1,3 +1,8 @@
+## 0.1.7
+
+* First published release carrying the 0.1.6 changes below; the 0.1.6 tag failed its pre-publish validation and never reached pub.dev.
+* Fixed the publish workflow: tracked files rewritten by CI tooling are now restored before publishing, so the published package matches the tagged commit.
+
 ## 0.1.6
 
 * Added `RichTextEditor.onOverscroll` — on web, the editor forwards the wheel delta to the host when it is scrolled past its own boundary (or has no scrollable overflow), so an enclosing scroll view can continue. Fixes the case where a web iframe swallows wheel events and an enclosing scrollable can't scroll while the pointer is over the editor. Purely additive and opt-in.
